@@ -151,25 +151,6 @@ class OFTLayer(BaseTunerLayer):
 
             warnings.warn("Unscaling operation for OFT not supported! Keeping scale to 1.")
 
-    def _check_forward_args(self, x, *args, **kwargs):
-        """Check if the arguments are compatible with the configs and state of the model"""
-        adapter_names = kwargs.get("adapter_names", None)
-        if adapter_names is None:
-            return
-
-        if len(x) != len(adapter_names):
-            msg = (
-                "Length of `adapter_names` should be the same as the number of inputs, but got "
-                f"{len(adapter_names)} and {len(x)} respectively."
-            )
-            raise ValueError(msg)
-
-        if self.merged:
-            # It is unclear what would be the right thing to do if users pass adapter_names and there are merged
-            # adapters. Therefore, it is better to raise an error in this case.
-            msg = "Cannot pass `adapter_names` when there are merged adapters, please call `unmerge_adapter` first."
-            raise ValueError(msg)
-
     def update_layer(self, adapter_name, r, oft_block_size, module_dropout, coft, eps, block_share, init_weights):
         """
         Update the linear layer with trainable OFT weights. Override for other layer types.
@@ -245,10 +226,11 @@ class OFTLayer(BaseTunerLayer):
             '''
             n_elements = oft_block_size * (oft_block_size - 1) // 2
             self.oft_r[adapter_name] = nn.Parameter(
-                torch.empty(r, n_elements)
+                torch.empty(r, n_elements, dtype=self.get_base_layer().weight.data.dtype)
             )
+
  
-        # self.oft_s[adapter_name] = nn.Parameter(torch.empty(int(self.out_features), 1))
+        self.oft_s[adapter_name] = nn.Parameter(torch.empty(int(self.out_features), 1))
 
         
         self.layout = torch.eye(r).unsqueeze(0).to(torch.int64)
@@ -276,14 +258,14 @@ class OFTLayer(BaseTunerLayer):
         """
         if init_weights is False:
             nn.init.normal_(self.oft_r[adapter_name], mean=0.0, std=0.1)
-            # nn.init.normal_(self.oft_s[adapter_name], mean=1.0, std=0.1)
+            nn.init.normal_(self.oft_s[adapter_name], mean=1.0, std=0.1)
             return
 
         if adapter_name in self.oft_r.keys():
             if init_weights is True:
                 # initialize oft_r to zero
                 nn.init.zeros_(self.oft_r[adapter_name])
-                # nn.init.ones_(self.oft_s[adapter_name])
+                nn.init.ones_(self.oft_s[adapter_name])
             else:
                 raise ValueError(f"Unknown initialization {init_weights=}")
 
@@ -594,9 +576,6 @@ class Linear(nn.Module, OFTLayer):
         return result
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
-
         previous_dtype = x.dtype
 
         if self.disable_adapters:
@@ -605,6 +584,124 @@ class Linear(nn.Module, OFTLayer):
             result = self.base_layer(x, *args, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
+
+            '''
+            else:
+                # oft_rotation = torch.eye(self.in_features, device=x.device)
+                oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
+                # oft_scale = torch.ones((int(self.out_features), 1), device=x.device)
+
+                for active_adapter in self.active_adapters:
+                    if active_adapter not in self.oft_r.keys():
+                        continue
+                    oft_r = self.oft_r[active_adapter]
+                    oft_block_size = self.oft_block_size[active_adapter]
+                    # oft_s = self.oft_s[active_adapter]
+                    # dropout = self.oft_dropout[active_adapter]
+
+                    rank = self.r[active_adapter]
+                    coft = self.coft[active_adapter]
+                    eps = self.eps[active_adapter]
+
+                    orth_rotate = oft_r
+
+                    if coft:
+                        with torch.no_grad():
+                            oft_r.copy_(self._project_batch(oft_r, eps=eps))
+                    orth_rotate = self._cayley_batch(oft_r, oft_block_size)
+                    # orth_rotate = dropout(orth_rotate)
+
+                    current_oft_rot_dtype = oft_rotation.dtype
+                    if orth_rotate.dtype != current_oft_rot_dtype:
+                        orth_rotate = orth_rotate.to(current_oft_rot_dtype)
+                    # oft_rotation = self.oft_matmul(orth_rotate, oft_rotation.unsqueeze(0)).squeeze(0)
+                    oft_rotation = orth_rotate @ oft_rotation
+                    oft_rotation = oft_rotation.to(current_oft_rot_dtype)
+
+                x = x.to(self.get_base_layer().weight.data.dtype)
+
+                orig_weight = self.get_base_layer().weight.data
+                orig_weight = torch.transpose(orig_weight, 0, 1)
+                # rotated_weight = self.oft_matmul(oft_rotation.to(orig_weight.dtype), orig_weight.unsqueeze(0)).squeeze(0)
+                
+                orig_weight_batched = orig_weight.reshape(rank, -1, self.out_features)
+                rotated_weight_batched = torch.bmm(oft_rotation, orig_weight_batched)
+                rotated_weight = rotated_weight_batched.reshape(-1, self.out_features)
+
+                # rotated_weight = torch.mm(oft_rotation, orig_weight.to(oft_rotation.dtype))
+                
+                rotated_weight = torch.transpose(rotated_weight, 0, 1)
+                # scaled_rotated_weight = rotated_weight # * oft_scale
+
+                x = self._cast_input_dtype(x, rotated_weight.dtype)
+                bias = self._cast_input_dtype(self.get_base_layer().bias, rotated_weight.dtype)
+                result = F.linear(input=x, weight=rotated_weight, bias=bias)
+
+            result = result.to(previous_dtype)
+            return result
+            '''
+            '''
+            else:
+                # oft_rotation = torch.eye(self.in_features, device=x.device)
+                # oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
+                # oft_scale = torch.ones((int(self.out_features), 1), device=x.device)
+
+                for active_adapter in self.active_adapters:
+                    if active_adapter not in self.oft_r.keys():
+                        continue
+                    oft_r = self.oft_r[active_adapter]
+                    oft_block_size = self.oft_block_size[active_adapter]
+                    # oft_s = self.oft_s[active_adapter]
+                    # dropout = self.oft_dropout[active_adapter]
+
+                    rank = self.r[active_adapter]
+                    coft = self.coft[active_adapter]
+                    eps = self.eps[active_adapter]
+
+                    oft_rotation = oft_r
+
+                    # if coft:
+                    #    with torch.no_grad():
+                    #        oft_r.copy_(self._project_batch(oft_r, eps=eps))
+                    # orth_rotate = self._cayley_batch(oft_r, oft_block_size)
+                    # orth_rotate = dropout(orth_rotate)
+
+                    # current_oft_rot_dtype = oft_rotation.dtype
+                    # if orth_rotate.dtype != current_oft_rot_dtype:
+                    #    orth_rotate = orth_rotate.to(current_oft_rot_dtype)
+                    # oft_rotation = self.oft_matmul(orth_rotate, oft_rotation.unsqueeze(0)).squeeze(0)
+                    # oft_rotation = orth_rotate @ oft_rotation
+                    # oft_rotation = oft_rotation.to(current_oft_rot_dtype)
+
+                lora_param = self.in_features * 16 + self.out_features * 16
+                print(f"lora_param: {lora_param / 1e6}M")
+                oft_param = oft_r.numel()
+                print(f"oft_param: {oft_param / 1e6}M")
+
+                x = x.to(self.get_base_layer().weight.data.dtype)
+
+                orig_weight = self.get_base_layer().weight.data
+                orig_weight = torch.transpose(orig_weight, 0, 1)
+                # rotated_weight = self.oft_matmul(oft_rotation.to(orig_weight.dtype), orig_weight.unsqueeze(0)).squeeze(0)
+                
+                orig_weight_batched = orig_weight.reshape(rank, -1, self.out_features)
+                rotated_weight_batched = torch.bmm(oft_rotation, orig_weight_batched)
+                rotated_weight = rotated_weight_batched.reshape(-1, self.out_features)
+
+                # rotated_weight = torch.mm(oft_rotation, orig_weight.to(oft_rotation.dtype))
+                
+                rotated_weight = torch.transpose(rotated_weight, 0, 1)
+                # scaled_rotated_weight = rotated_weight # * oft_scale
+
+                x = self._cast_input_dtype(x, rotated_weight.dtype)
+                bias = self._cast_input_dtype(self.get_base_layer().bias, rotated_weight.dtype)
+                # result = F.linear(input=x, weight=rotated_weight, bias=bias)
+
+                result = x @ rotated_weight.t() # + bias
+
+            result = result.to(previous_dtype)
+            return result
+            '''
         else:
             # oft_rotation = torch.eye(self.in_features, device=x.device)
             oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
@@ -635,6 +732,11 @@ class Linear(nn.Module, OFTLayer):
                 oft_rotation = torch.bmm(orth_rotate, oft_rotation)
                 oft_rotation = oft_rotation.to(current_oft_rot_dtype)
 
+            # lora_param = self.in_features * 16 + self.out_features * 16
+            # print(f"lora_param: {lora_param / 1e6}M")
+            # oft_param = oft_r.numel()
+            # print(f"oft_param: {oft_param / 1e6}M")
+
             x = x.to(self.get_base_layer().weight.data.dtype)
 
             batch_dims = x.shape[:-1]
@@ -642,10 +744,35 @@ class Linear(nn.Module, OFTLayer):
             x_rotated_reshaped = torch.einsum('rck,...rk->...rc', oft_rotation, x_reshaped)
             x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
             x_rotated = x_rotated.to(self.get_base_layer().weight.dtype)
-            
             result = self.base_layer(x_rotated, *args, **kwargs)
+            # x_rotated_batched = torch.bmm(oft_rotation, x_batched.unsqueeze(-1)).squeeze(0)
+            # x_rotated = x_rotated_batched.reshape(-1, self.in_features)
 
+            # result = self.base_layer(x_rotated, *args, **kwargs)
+
+            '''
+            orig_weight = self.get_base_layer().weight.data
+
+            breakpoint()
+
+            orig_weight = torch.transpose(orig_weight, 0, 1)
+            # rotated_weight = self.oft_matmul(oft_rotation.to(orig_weight.dtype), orig_weight.unsqueeze(0)).squeeze(0)
+            
+            orig_weight_batched = orig_weight.reshape(rank, -1, self.out_features)
+            rotated_weight_batched = torch.bmm(oft_rotation, orig_weight_batched)
+            rotated_weight = rotated_weight_batched.reshape(-1, self.out_features)
+
+            # rotated_weight = torch.mm(oft_rotation, orig_weight.to(oft_rotation.dtype))
+            
+            rotated_weight = torch.transpose(rotated_weight, 0, 1)
+            # scaled_rotated_weight = rotated_weight # * oft_scale
+
+            x = self._cast_input_dtype(x, rotated_weight.dtype)
+            bias = self._cast_input_dtype(self.get_base_layer().bias, rotated_weight.dtype)
+            result = F.linear(input=x, weight=rotated_weight, bias=bias)
+            '''
         result = result.to(previous_dtype)
+
         return result
 
     def forward_working_backup(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
@@ -1140,45 +1267,3 @@ class Conv2d(nn.Module, OFTLayer):
     def __repr__(self) -> str:
         rep = super().__repr__()
         return "oft." + rep
-
-
-def dispatch_default(
-    target: torch.nn.Module,
-    adapter_name: str,
-    oft_config: OFTConfig,
-    **kwargs,
-) -> Optional[torch.nn.Module]:
-    new_module = None
-
-    breakpoint()
-
-    if isinstance(target, BaseTunerLayer):
-        target_base_layer = target.get_base_layer()
-    else:
-        target_base_layer = target
-
-    if isinstance(target_base_layer, torch.nn.Embedding):
-        embedding_kwargs = kwargs.copy()
-        embedding_kwargs.pop("fan_in_fan_out", None)
-        new_module = Embedding(target, adapter_name, **embedding_kwargs)
-    elif isinstance(target_base_layer, torch.nn.Conv2d):
-        new_module = Conv2d(target, adapter_name, **kwargs)
-    elif isinstance(target_base_layer, nn.Conv1d):
-        new_module = Conv1d(target, adapter_name, **kwargs)
-    elif isinstance(target_base_layer, torch.nn.Linear):
-        if kwargs["fan_in_fan_out"]:
-            warnings.warn(
-                "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
-                "Setting fan_in_fan_out to False."
-            )
-            kwargs["fan_in_fan_out"] = oft_config.fan_in_fan_out = False
-        new_module = Linear(target, adapter_name, **kwargs)
-    elif isinstance(target_base_layer, Conv1D):
-        if not kwargs["fan_in_fan_out"]:
-            warnings.warn(
-                "fan_in_fan_out is set to False but the target module is `Conv1D`. Setting fan_in_fan_out to True."
-            )
-            kwargs["fan_in_fan_out"] = oft_config.fan_in_fan_out = True
-        new_module = Linear(target, adapter_name, is_target_conv_1d_layer=True, **kwargs)
-
-    return new_module

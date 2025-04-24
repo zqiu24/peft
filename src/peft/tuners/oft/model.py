@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
+from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 from peft.tuners.tuners_utils import (
     BaseTuner,
     BaseTunerLayer,
@@ -31,10 +32,14 @@ from peft.utils import (
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     ModulesToSaveWrapper,
     _get_submodules,
+    get_quantization_config,
 )
 
 from .config import OFTConfig
-from .layer import Conv2d, Linear, OFTLayer
+from .layer import Conv2d, Linear, OFTLayer, dispatch_default
+
+from .awq import dispatch_awq
+from .gptq import dispatch_gptq
 
 
 class OFTModel(BaseTuner):
@@ -136,8 +141,16 @@ class OFTModel(BaseTuner):
             "block_share": oft_config.block_share,
             "fan_in_fan_out": oft_config.fan_in_fan_out,
             "init_weights": oft_config.init_weights,
+            "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
+            "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
         kwargs["bias"] = bias
+
+        quant_methods = ["gptq", "aqlm", "awq"]
+        for quant_method in quant_methods:
+            quantization_config = get_quantization_config(self.model, method=quant_method)
+            if quantization_config is not None:
+                kwargs[f"{quant_method}_quantization_config"] = quantization_config
 
         # If it is not a OFTLayer, create a new module, else update it with new adapters
         if not isinstance(target, OFTLayer):
@@ -157,7 +170,7 @@ class OFTModel(BaseTuner):
                 block_share=oft_config.block_share,
                 init_weights=oft_config.init_weights,
             )
-
+    '''
     def _replace_module(self, parent, child_name, new_module, child):
         setattr(parent, child_name, new_module)
         # It's not necessary to set requires_grad here, as that is handled by
@@ -185,6 +198,33 @@ class OFTModel(BaseTuner):
             if self.prefix in name:
                 if not any(p.device == meta for p in module.parameters()):
                     module.to(child.weight.device)
+    '''
+
+    def _replace_module(self, parent, child_name, new_module, child):
+        setattr(parent, child_name, new_module)
+        # It's not necessary to set requires_grad here, as that is handled by
+        # _mark_only_adapters_as_trainable
+
+        # child layer wraps the original module, unpack it
+        if hasattr(child, "base_layer"):
+            child = child.base_layer
+
+        meta = torch.device("meta")
+        # dispatch to correct device
+        for name, module in new_module.named_modules():
+            if (self.prefix in name) or ("ranknum" in name):
+                if hasattr(child, "qweight"):
+                    weight = child.qweight
+                elif hasattr(child, "W_q"):
+                    weight = child.W_q
+                elif hasattr(child, "weight"):
+                    weight = child.weight
+                elif getattr(child, "in_proj_weight", None) is not None:  # MHA
+                    weight = child.in_proj_weight
+                else:
+                    weight = next(child.parameters())
+                if not any(p.device == meta for p in module.parameters()):
+                    module.to(weight.device)
 
     def _mark_only_adapters_as_trainable(self, model: nn.Module) -> None:
         for n, p in model.named_parameters():
@@ -207,6 +247,7 @@ class OFTModel(BaseTuner):
             else:
                 raise NotImplementedError(f"Requested bias: {bias}, is not implemented.")
 
+    '''
     @staticmethod
     def _create_new_module(oft_config, adapter_name, target, **kwargs):
         if isinstance(target, BaseTunerLayer):
@@ -228,6 +269,48 @@ class OFTModel(BaseTuner):
             raise ValueError(
                 f"Target module {target} is not supported. "
                 "Currently, only `torch.nn.Linear` and `torch.nn.Conv2d` are supported."
+            )
+
+        return new_module
+    '''
+
+    @staticmethod
+    def _create_new_module(oft_config, adapter_name, target, **kwargs):
+        # Collect dispatcher functions to decide what backend to use for the replaced LoRA layer. The order matters,
+        # because the first match is always used. Therefore, the default layers should be checked last.
+        dispatchers = []
+
+        # avoid eager bnb import
+        if is_bnb_available():
+            from .bnb import dispatch_bnb_8bit
+
+            dispatchers.append(dispatch_bnb_8bit)
+
+        if is_bnb_4bit_available():
+            from .bnb import dispatch_bnb_4bit
+
+            dispatchers.append(dispatch_bnb_4bit)
+
+        dispatchers.extend(
+            [
+                dispatch_awq,
+                dispatch_gptq,
+                dispatch_default,
+            ]
+        )
+
+        new_module = None
+        for dispatcher in dispatchers:
+            new_module = dispatcher(target, adapter_name, oft_config=oft_config, **kwargs)
+            if new_module is not None:  # first match wins
+                break
+
+        if new_module is None:
+            # no module could be matched
+            raise ValueError(
+                f"Target module {target} is not supported. Currently, only the following modules are supported: "
+                "`torch.nn.Linear`, `torch.nn.Embedding`, `torch.nn.Conv1d`, `torch.nn.Conv2d`, `torch.nn.Conv3d`, "
+                "`transformers.pytorch_utils.Conv1D`, `torch.nn.MultiheadAttention.`."
             )
 
         return new_module

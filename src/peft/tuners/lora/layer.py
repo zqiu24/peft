@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import time
 import math
 import warnings
 from typing import Any, Optional, Union
@@ -704,6 +705,8 @@ class Linear(nn.Module, LoraLayer):
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
 
+        breakpoint()
+
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -713,6 +716,7 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
+            breakpoint()
             result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
 
@@ -736,7 +740,11 @@ class Linear(nn.Module, LoraLayer):
                         result=result,
                     )
 
+            # timings["total"] = time.time() - total_start_time
+
             result = result.to(torch_result_dtype)
+
+        # breakpoint()
 
         return result
 
@@ -1720,6 +1728,8 @@ def dispatch_default(
     **kwargs,
 ) -> Optional[torch.nn.Module]:
     new_module = None
+
+    breakpoint()
 
     if isinstance(target, BaseTunerLayer):
         target_base_layer = target.get_base_layer()
