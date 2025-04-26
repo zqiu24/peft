@@ -639,7 +639,7 @@ class Linear(nn.Module, OFTLayer):
 
             batch_dims = x.shape[:-1]
             x_reshaped = x.view(*batch_dims, rank, -1)
-            x_rotated_reshaped = torch.einsum('rck,...rk->...rc', oft_rotation, x_reshaped)
+            x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, oft_rotation)
             x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
             x_rotated = x_rotated.to(self.get_base_layer().weight.dtype)
             
