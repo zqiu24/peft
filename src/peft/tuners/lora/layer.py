@@ -509,6 +509,8 @@ class LoraLayer(BaseTunerLayer):
         result = self.base_layer(x, *args, **kwargs)
         torch_result_dtype = result.dtype
 
+        breakpoint()
+
         unique_adapters = set(adapter_names)
         sub_batch_indices_list = []
         for adapter in unique_adapters:
@@ -705,8 +707,6 @@ class Linear(nn.Module, LoraLayer):
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
 
-        breakpoint()
-
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -716,7 +716,6 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            breakpoint()
             result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
 
@@ -989,6 +988,8 @@ class Embedding(nn.Module, LoraLayer):
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
 
+        breakpoint()
+
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -1254,6 +1255,8 @@ class _ConvNd(nn.Module, LoraLayer):
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
+
+        breakpoint()
 
         if self.disable_adapters:
             if self.merged:
@@ -1646,6 +1649,8 @@ class MultiheadAttention(nn.Module, LoraLayer):
         previous_dtype = x.dtype
         self._check_forward_args(x, *args, **kwargs)
 
+        breakpoint()
+
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -1728,8 +1733,6 @@ def dispatch_default(
     **kwargs,
 ) -> Optional[torch.nn.Module]:
     new_module = None
-
-    breakpoint()
 
     if isinstance(target, BaseTunerLayer):
         target_base_layer = target.get_base_layer()

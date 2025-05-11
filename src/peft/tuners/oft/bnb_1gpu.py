@@ -463,7 +463,7 @@ if is_bnb_4bit_available():
             elif self.merged:
                 result = self.base_layer(x, *args, **kwargs)
             else:
-                # oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
+                oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
 
                 # result = self.base_layer(x, *args, **kwargs)
                 # As per Tim Dettmers, for 4bit, we need to defensively clone here.
@@ -472,6 +472,10 @@ if is_bnb_4bit_available():
                 # newer PyTorch versions but this would need extensive testing to be
                 # sure.
                 # result = result.clone()
+
+                if x.device != self.get_base_layer().weight.device:
+                    print(f"DEVICE MISMATCH: input tensor on {x.device}, base layer on {base_device}")
+                    breakpoint()
                 
                 for active_adapter in self.active_adapters:
                     if active_adapter not in self.oft_r.keys():
@@ -485,7 +489,6 @@ if is_bnb_4bit_available():
                     coft = self.coft[active_adapter]
                     eps = self.eps[active_adapter]
 
-                    '''
                     requires_conversion = not torch.is_autocast_enabled()
                     if requires_conversion:
                         expected_dtype = x.dtype
@@ -504,24 +507,20 @@ if is_bnb_4bit_available():
                     oft_rotation = torch.bmm(orth_rotate, oft_rotation)
                     oft_rotation = oft_rotation.to(current_oft_rot_dtype)
 
-
                 batch_dims = x.shape[:-1]
                 x_reshaped = x.view(*batch_dims, rank, -1)
                 # x_reshaped = x.reshape(*batch_dims, rank, -1)
                 x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, oft_rotation)
                 # x_rotated_reshaped = torch.einsum('rkc,...rk->...rc', oft_rotation.transpose(-1, -2), x_reshaped)
                 x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
-                '''
-                
-                x_rotated = oft_r(x)
-                
+
                 result = self.base_layer(x_rotated, *args, **kwargs)
 
             return result
 
         def __repr__(self) -> str:
             rep = super().__repr__()
-            return "lora." + rep
+            return "oft." + rep
 
     def dispatch_bnb_4bit(target: torch.nn.Module, adapter_name: str, **kwargs):
         new_module = None

@@ -521,7 +521,7 @@ if is_bnb_4bit_available():
 
         def __repr__(self) -> str:
             rep = super().__repr__()
-            return "lora." + rep
+            return "oft." + rep
 
     def dispatch_bnb_4bit(target: torch.nn.Module, adapter_name: str, **kwargs):
         new_module = None

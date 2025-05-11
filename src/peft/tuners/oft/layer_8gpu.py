@@ -105,8 +105,8 @@ class OFTRotationModule(nn.Module):
 
         #Q_skew_start = time.time()
         # Q_skew = 0.5 * (Q - Q.transpose(1, 2))
-        # Q_skew = SkewSymmetric.apply(Q, block_size)
-        Q_skew = self.pytorch_skew_symmetric(Q, block_size)
+        Q_skew = SkewSymmetric.apply(Q, block_size)
+        # Q_skew = self.pytorch_skew_symmetric(Q, block_size)
         #timings["Q_skew"] = time.time() - Q_skew_start
 
         #R_start = time.time()
@@ -137,10 +137,6 @@ class OFTRotationModule(nn.Module):
         # It's primarily a container for the parameter
         # The actual transformation logic stays in your OFTLayer
 
-        required_dtype = x.dtype
-        if required_dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
-
         oft_rotation = self._cayley_batch(self.weight, self.block_size)
 
         orig_shape = x.shape
@@ -153,7 +149,7 @@ class OFTRotationModule(nn.Module):
         # x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, oft_rotation)
         # x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
 
-        return x_rotated.to(required_dtype)
+        return x_rotated
 
 class OFTLayer(BaseTunerLayer):
     """
@@ -760,7 +756,7 @@ class Linear(nn.Module, OFTLayer):
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.oft_r.keys():
                     continue
-                oft_r = self.oft_r[active_adapter]
+                oft_r = self.oft_r[active_adapter].weight
                 oft_block_size = self.oft_block_size[active_adapter]
                 # oft_s = self.oft_s[active_adapter]
                 # dropout = self.oft_dropout[active_adapter]
@@ -795,7 +791,7 @@ class Linear(nn.Module, OFTLayer):
             x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
             x_rotated = x_rotated.to(self.get_base_layer().weight.dtype)
             '''
-            x_rotated = oft_r(x)
+            x_rotated = oft_r[active_adapter](x)
             
             result = self.base_layer(x_rotated, *args, **kwargs)
 

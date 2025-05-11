@@ -312,7 +312,7 @@ def test_oft_forward_equivalence(B, N, r, b, dtype, device='cuda'):
         orth_rotate_batch = _cayley_batch(oft_r, b) # R blocks
         R_full = _block_diagonal(orth_rotate_batch, r) # R
 
-        W1 = base_layer.weight.clone()
+        W1 = base_layer.weight.clone() # out_features x in_features
         bias1 = base_layer.bias.clone() if base_layer.bias is not None else None
         x1 = x.clone()
 
@@ -353,6 +353,7 @@ def test_oft_forward_equivalence(B, N, r, b, dtype, device='cuda'):
         batch_dims = x2.shape[:-1]
         x_reshaped = x2.view(*batch_dims, r, -1)
         x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, orth_rotate)
+        # x_rotated_reshaped = torch.einsum('rkc,...rk->...rc', orth_rotate, x_reshaped)
         x_rotated = x_rotated_reshaped.reshape(*batch_dims, in_features)
         y2 = F.linear(x_rotated, W2, bias2)
 
@@ -364,6 +365,8 @@ def test_oft_forward_equivalence(B, N, r, b, dtype, device='cuda'):
     print("Comparing results (original dtype)...")
     y1_comp = y1 # No conversion
     y2_comp = y2 # No conversion
+
+    breakpoint()
 
     # Use tolerances appropriate for the original dtype
     if dtype == torch.float32:
@@ -403,7 +406,7 @@ if __name__ == '__main__':
     N = 16
     r = 8
     b = 32 # Block size must be >= 2 for skew-symmetric matrices
-    dtype = torch.bfloat16
+    dtype = torch.float32 # torch.bfloat16
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # ---------------------
 

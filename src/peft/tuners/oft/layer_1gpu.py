@@ -73,88 +73,6 @@ class MultiplicativeDropoutLayer(nn.Module):
         return x
 
 
-class OFTRotationModule(nn.Module):
-    def __init__(self, r, n_elements, block_size):
-        super().__init__()
-        self.r = r
-        self.n_elements = n_elements
-        self.block_size = block_size
-        self.weight = nn.Parameter(torch.empty(r, n_elements))
-        self.in_features = r * block_size
-
-    def pytorch_skew_symmetric(self, vec, block_size):
-        batch_size = vec.shape[0]
-        matrix = torch.zeros(batch_size, block_size, block_size, 
-                            device=vec.device, dtype=vec.dtype)
-        
-        # Create indices for upper triangle (excluding diagonal)
-        rows, cols = torch.triu_indices(block_size, block_size, 1, device=vec.device)
-        matrix[:, rows, cols] = vec
-        matrix = matrix - matrix.transpose(-2, -1)
-        return matrix
-        
-    def _cayley_batch(self, Q: torch.Tensor, block_size: int, num_neumann_terms: int = 5) -> torch.Tensor:
-        """
-        Perform the Cayley parametrization on a batch of skew-symmetric matrices.
-
-        Args:
-            data: A batch of skew-symmetric matrices of shape (b, r, c).
-        """
-
-        b, _ = Q.shape
-
-        #Q_skew_start = time.time()
-        # Q_skew = 0.5 * (Q - Q.transpose(1, 2))
-        # Q_skew = SkewSymmetric.apply(Q, block_size)
-        Q_skew = self.pytorch_skew_symmetric(Q, block_size)
-        #timings["Q_skew"] = time.time() - Q_skew_start
-
-        #R_start = time.time()
-        R = torch.eye(block_size, device=Q.device, dtype=Q.dtype).repeat(b, 1, 1)
-        if num_neumann_terms > 1:
-            R.add_(Q_skew, alpha=2.0)
-            # R = R + 2.0 * Q_skew
-            if num_neumann_terms > 2:
-                Q_squared = torch.bmm(Q_skew, Q_skew)
-                R.add_(Q_squared, alpha=2.0)
-                # R = R + 2.0 * Q_squared
-
-                Q_power = Q_squared
-                for i in range(3, num_neumann_terms):
-                    Q_power = torch.bmm(Q_power, Q_skew)
-                    R.add_(Q_power, alpha=2.0)
-                    # R = R + 2.0 * Q_power
-        
-        #R_end = time.time()
-        #timings["R"] = R_end - R_start
-
-        #timings["total"] = time.time() - total_start_time
-        #breakpoint()
-        return R #.to(previous_dtype)
-    
-    def forward(self, x):
-        # This module doesn't need to implement the orthogonal transform
-        # It's primarily a container for the parameter
-        # The actual transformation logic stays in your OFTLayer
-
-        required_dtype = x.dtype
-        if required_dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
-
-        oft_rotation = self._cayley_batch(self.weight, self.block_size)
-
-        orig_shape = x.shape
-        x_reshaped = x.reshape(orig_shape[0], orig_shape[1], self.r, self.block_size)
-        x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, oft_rotation)
-        x_rotated = x_rotated_reshaped.reshape(*orig_shape)
-
-        # batch_dims = x.shape[:-1]
-        # x_reshaped = x.view(*batch_dims, self.r, -1)
-        # x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, oft_rotation)
-        # x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
-
-        return x_rotated.to(required_dtype)
-
 class OFTLayer(BaseTunerLayer):
     """
     Implements the OFT layer.
@@ -335,19 +253,30 @@ class OFTLayer(BaseTunerLayer):
                 torch.empty(1, math.ceil(self.in_features / r), math.ceil(self.in_features / r))
             )
         else:     
-            # self.oft_r[adapter_name] = nn.Linear(self.in_features, self.in_features, bias=False)
+            ''' 
+            self.oft_r[adapter_name] = nn.Parameter(torch.empty(self.in_features, 16))
+            self.oft_s[adapter_name] = nn.Parameter(torch.empty(16, self.out_features))
 
+            # self.lora_A[adapter_name] = nn.Linear(self.in_features, 16)
+            # self.lora_B[adapter_name] = nn.Linear(16, self.out_features)
+
+            '''
             def is_power_of_2(n):
                 return n>0 and (n & (n-1)) == 0
             if not is_power_of_2(oft_block_size):
                 breakpoint()
 
+            # print(f"oft_block_size: {oft_block_size}, r: {r}, in_features: {self.in_features}")
+            '''
+            self.oft_r[adapter_name] = nn.Parameter(
+                torch.empty(r, math.ceil(self.in_features / r), math.ceil(self.in_features / r), dtype=self.get_base_layer().weight.data.dtype)
+            )
+            '''
             n_elements = oft_block_size * (oft_block_size - 1) // 2
-            # self.oft_r[adapter_name] = nn.Parameter(
-            #     torch.empty(r, n_elements, dtype=self.get_base_layer().weight.data.dtype)
-            # )
-            self.oft_r[adapter_name] = OFTRotationModule(r, n_elements, oft_block_size) #, self.get_base_layer().weight.data.dtype, self.get_base_layer().weight.data.device)
-            
+            self.oft_r[adapter_name] = nn.Parameter(
+                torch.empty(r, n_elements)
+            )
+ 
         # self.oft_s[adapter_name] = nn.Parameter(torch.empty(int(self.out_features), 1))
         # self.oft_s[adapter_name] = nn.Parameter(torch.ones(1))
 
@@ -391,28 +320,11 @@ class OFTLayer(BaseTunerLayer):
         if adapter_name in self.oft_r.keys():
             if init_weights is True:
                 # initialize oft_r to zero
-                nn.init.zeros_(self.oft_r[adapter_name].weight)
+                nn.init.zeros_(self.oft_r[adapter_name])
                 # nn.init.ones_(self.oft_s[adapter_name])
             else:
                 raise ValueError(f"Unknown initialization {init_weights=}")
 
-    def pytorch_skew_symmetric(self, vec, block_size):
-        batch_size = vec.shape[0]
-        matrix = torch.zeros(batch_size, block_size, block_size, 
-                            device=vec.device, dtype=vec.dtype)
-        
-        # Create indices for upper triangle (excluding diagonal)
-        rows, cols = torch.triu_indices(block_size, block_size, 1, device=vec.device)
-        
-        # Fill upper triangle
-        matrix[:, rows, cols] = vec
-        
-        # Make skew-symmetric
-        matrix = matrix - matrix.transpose(-2, -1)
-        
-        return matrix 
-    
-    
     def _cayley_batch(self, Q: torch.Tensor, block_size: int, num_neumann_terms: int = 5) -> torch.Tensor:
         """
         Perform the Cayley parametrization on a batch of skew-symmetric matrices.
@@ -428,27 +340,23 @@ class OFTLayer(BaseTunerLayer):
        # Q = Q.to(torch.float32)
         b, _ = Q.shape
 
-        # Q_skew_start = time.time()
+        #Q_skew_start = time.time()
         # Q_skew = 0.5 * (Q - Q.transpose(1, 2))
-        # Q_skew = SkewSymmetric.apply(Q, block_size)
-        Q_skew = self.pytorch_skew_symmetric(Q, block_size)
+        Q_skew = SkewSymmetric.apply(Q, block_size)
         #timings["Q_skew"] = time.time() - Q_skew_start
 
         #R_start = time.time()
         R = torch.eye(block_size, device=Q.device, dtype=Q.dtype).repeat(b, 1, 1)
         if num_neumann_terms > 1:
-            # R.add_(Q_skew, alpha=2.0)
-            R = R + 2.0 * Q_skew
+            R.add_(Q_skew, alpha=2.0)
             if num_neumann_terms > 2:
                 Q_squared = torch.bmm(Q_skew, Q_skew)
-                # R.add_(Q_squared, alpha=2.0)
-                R = R + 2.0 * Q_squared
+                R.add_(Q_squared, alpha=2.0)
 
                 Q_power = Q_squared
                 for i in range(3, num_neumann_terms):
                     Q_power = torch.bmm(Q_power, Q_skew)
-                    # R.add_(Q_power, alpha=2.0)
-                    R = R + 2.0 * Q_power
+                    R.add_(Q_power, alpha=2.0)
         
         #R_end = time.time()
         #timings["R"] = R_end - R_start
@@ -742,7 +650,7 @@ class Linear(nn.Module, OFTLayer):
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
 
-        # previous_dtype = x.dtype
+        previous_dtype = x.dtype
 
         if self.disable_adapters:
             if self.merged:
@@ -752,8 +660,7 @@ class Linear(nn.Module, OFTLayer):
             result = self.base_layer(x, *args, **kwargs)
         else:
             # oft_rotation = torch.eye(self.in_features, device=x.device)
-            # oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
-
+            oft_rotation = torch.eye(self.bs, device=x.device, dtype=x.dtype).repeat(self.rank, 1, 1)
             # oft_scale = torch.ones((int(self.out_features), 1), device=x.device)
             # oft_scale = torch.ones(1, device=x.device)
 
@@ -769,7 +676,6 @@ class Linear(nn.Module, OFTLayer):
                 coft = self.coft[active_adapter]
                 eps = self.eps[active_adapter]
 
-                '''
                 if coft:
                     with torch.no_grad():
                         oft_r.copy_(self._project_batch(oft_r, eps=eps))
@@ -784,7 +690,6 @@ class Linear(nn.Module, OFTLayer):
 
                 # oft_scale = oft_s * oft_scale
 
-
             # x = self._cast_input_dtype(x, oft_r.dtype)
             x = x.to(self.get_base_layer().weight.data.dtype)
             # x = dropout(x) # * oft_scale
@@ -794,12 +699,10 @@ class Linear(nn.Module, OFTLayer):
             x_rotated_reshaped = torch.einsum('...rk,rkc->...rc', x_reshaped, oft_rotation)
             x_rotated = x_rotated_reshaped.reshape(*batch_dims, self.in_features)
             x_rotated = x_rotated.to(self.get_base_layer().weight.dtype)
-            '''
-            x_rotated = oft_r(x)
             
             result = self.base_layer(x_rotated, *args, **kwargs)
 
-        # result = result.to(previous_dtype)
+        result = result.to(previous_dtype)
         return result
 
     def forward_working_backup(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
@@ -1106,9 +1009,6 @@ class Conv2d(nn.Module, OFTLayer):
         # Move new weights to device
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
-
-        if self.oft_r[adapter_name].device != base_layer.weight.device:
-            breakpoint()
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """

@@ -433,6 +433,8 @@ if is_bnb_4bit_available():
             # extra argument that allows mixing different adapters in the same batch at inference time.
             result = self.base_layer(x, *args, **kwargs)
 
+            breakpoint()
+
             unique_adapters = set(adapter_names)
             sub_batch_indices_list = []
             for adapter in unique_adapters:
