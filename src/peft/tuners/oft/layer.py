@@ -261,10 +261,11 @@ class OFTRotationModule(nn.Module):
         # It's primarily a container for the parameter
         # The actual transformation logic stays in your OFTLayer
 
+        breakpoint()
+
         # P = torch.eye(self.in_features, device=self.weight.device, dtype=self.weight.dtype, requires_grad=False)[self.permutation_indices]
-        
-        x = x[..., self.inv_permutation_indices]
-        x.contiguous()
+        # x = x[..., self.inv_permutation_indices]
+        # x.contiguous()
         # x = x @ self.P
         # x = TritonPermute.apply(x, self.inv_permutation_indices, self.permutation_indices)
 
@@ -302,8 +303,8 @@ class OFTRotationModule(nn.Module):
         if len(orig_shape) == 4:
             x_rotated = self._fold(x_rotated, orig_shape)
 
-        x_rotated = x_rotated[..., self.permutation_indices]
-        x_rotated.contiguous()
+        # x_rotated = x_rotated[..., self.permutation_indices]
+        # x_rotated.contiguous()
         # x_rotated = x_rotated @ self.P.T
         # x_rotated = TritonPermute.apply(x_rotated, self.permutation_indices, self.inv_permutation_indices)
 
