@@ -37,7 +37,7 @@ def main(model_path):
     response_template = "### Assistant:"
     collator = DataCollatorForCompletionOnlyLM(instruction_template=instruction_template, response_template=response_template, tokenizer=tokenizer, mlm=False)
 
-    ds = load_dataset("timdettmers/openassistant-guanaco", cache_dir="/tmp/hf_cache")
+    ds = load_dataset("timdettmers/openassistant-guanaco") #, cache_dir="/tmp/hf_cache")
     #Add the EOS token
     def process(row):
         row["text"] = row["text"]+"<|end_of_text|>"
