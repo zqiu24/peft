@@ -24,6 +24,8 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .config import OFTConfig
 
+from .permutation_kernel import TritonPermute
+
 
 class MultiplicativeDropoutLayer(nn.Module):
     """
@@ -76,6 +78,7 @@ class OFTRotationModule(nn.Module):
         n_elements,
         block_size,
         in_features,
+        out_features,
         coft=False,
         eps=6e-5,
         block_share=False,
@@ -88,6 +91,7 @@ class OFTRotationModule(nn.Module):
         self.n_elements = n_elements
         self.block_size = block_size
         self.in_features = in_features
+        self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(r, n_elements))
         self.coft = coft
         self.eps = eps
@@ -98,6 +102,8 @@ class OFTRotationModule(nn.Module):
         self.num_cayley_neumann_terms = num_cayley_neumann_terms
         # Create indices for upper triangle (excluding diagonal)
         self.rows, self.cols = torch.triu_indices(block_size, block_size, 1)
+
+        self.update_permutation()
 
     def _pytorch_skew_symmetric(self, vec, block_size):
         batch_size = vec.shape[0]
@@ -239,10 +245,28 @@ class OFTRotationModule(nn.Module):
 
         return x_folded
 
+    def update_permutation(self):
+        """Update the permutation of the indices."""
+        with torch.no_grad():
+            # Update permutation indices
+            self.register_buffer('permutation_indices',torch.randperm(self.in_features, device=self.weight.device))
+            self.register_buffer('inv_permutation_indices', torch.argsort(self.permutation_indices))
+            # Update permutation matrices
+            # self.register_buffer('P', torch.eye(self.in_features, device=self.weight.device, dtype=self.weight.dtype)[self.permutation_indices])
+            # self.register_buffer('P_T', torch.eye(self.in_features, device=self.weight.device, dtype=self.weight.dtype)[self.inv_permutation_indices])
+
+
     def forward(self, x):
         # This module doesn't need to implement the orthogonal transform
         # It's primarily a container for the parameter
         # The actual transformation logic stays in your OFTLayer
+
+        # P = torch.eye(self.in_features, device=self.weight.device, dtype=self.weight.dtype, requires_grad=False)[self.permutation_indices]
+        
+        x = x[..., self.inv_permutation_indices]
+        x.contiguous()
+        # x = x @ self.P
+        # x = TritonPermute.apply(x, self.inv_permutation_indices, self.permutation_indices)
 
         required_dtype = x.dtype
         if required_dtype != self.weight.dtype:
@@ -277,6 +301,11 @@ class OFTRotationModule(nn.Module):
 
         if len(orig_shape) == 4:
             x_rotated = self._fold(x_rotated, orig_shape)
+
+        x_rotated = x_rotated[..., self.permutation_indices]
+        x_rotated.contiguous()
+        # x_rotated = x_rotated @ self.P.T
+        # x_rotated = TritonPermute.apply(x_rotated, self.permutation_indices, self.inv_permutation_indices)
 
         return x_rotated.to(required_dtype)
 
@@ -372,6 +401,11 @@ class OFTLayer(BaseTunerLayer):
         self.in_features = in_features
         self.out_features = out_features
 
+        self.gradient_accumulation_steps = 1
+        self.update_reset_R_gap = 0
+        self.global_step_counter = 0
+
+
     @property
     def _available_adapters(self) -> set[str]:
         return {*self.oft_R}
@@ -463,6 +497,7 @@ class OFTLayer(BaseTunerLayer):
             n_elements,
             oft_block_size,
             self.in_features,
+            self.out_features,
             coft=coft,
             eps=eps,
             block_share=block_share,
@@ -637,8 +672,43 @@ class Linear(nn.Module, OFTLayer):
 
         return self.oft_R[adapter_name].get_weight()
 
+    def merge_and_reset_R(self, active_adapter: str = None) -> None:
+        """
+        Merge the active adapter weights into the base weights
+
+        Args:
+            safe_merge (`bool`, *optional*):
+                If `True`, the merge operation will be performed in a copy of the original weights and check for NaNs
+                before merging the weights. This is useful if you want to check if the merge operation will produce
+                NaNs. Defaults to `False`.
+            adapter_names (`List[str]`, *optional*):
+                The list of adapter names that should be merged. If `None`, all active adapters will be merged.
+                Defaults to `None`.
+        """
+        base_layer = self.get_base_layer()
+        orig_dtype = base_layer.weight.dtype
+
+        orig_weights = base_layer.weight.data
+        oft_mat = self.get_delta_weight(active_adapter)
+        orig_weights = torch.transpose(orig_weights, 0, 1)
+        orig_weights = torch.mm(oft_mat, orig_weights.to(oft_mat.dtype))
+        orig_weights = torch.transpose(orig_weights, 0, 1)
+
+        base_layer.weight.data = orig_weights.contiguous().to(orig_dtype)
+
+        self.oft_R[active_adapter].weight.data = torch.zeros_like(self.oft_R[active_adapter].weight.data)
+        self.oft_R[active_adapter].update_permutation()
+
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         previous_dtype = x.dtype
+
+        if (self.update_reset_R_gap * self.gradient_accumulation_steps) > 0 and \
+           self.global_step_counter % (self.update_reset_R_gap * self.gradient_accumulation_steps * 2) == 0 and \
+           self.global_step_counter > 0:
+            # prevent duplicate resets because of gradient accumulation
+            if not hasattr(self, 'last_reset_step') or self.last_reset_step != self.global_step_counter:
+                self.merge_and_reset_R(self.active_adapters[0])
+                self.last_reset_step = self.global_step_counter
 
         if self.disable_adapters:
             if self.merged:
@@ -656,6 +726,9 @@ class Linear(nn.Module, OFTLayer):
                 x = oft_R(x)
 
             result = self.base_layer(x.to(previous_dtype), *args, **kwargs)
+
+        if self.training:
+            self.global_step_counter += 1
 
         result = result.to(previous_dtype)
         return result
